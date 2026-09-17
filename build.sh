@@ -178,7 +178,8 @@ cat > "$OUTPUT_MANIFEST" <<EOF
     "usb-modeswitch": "${USB_MODESWITCH_VERSION}",
     "bluez": "${BLUEZ_VERSION}",
     "pipewire-audio": "${PIPEWIRE_AUDIO_VERSION}",
-    "wireplumber": "${WIREPLUMBER_VERSION}"
+    "wireplumber": "${WIREPLUMBER_VERSION}",
+    "xfce4-pulseaudio-plugin": "${XFCE_PULSEAUDIO_PLUGIN_VERSION}"
   },
   "driver": {
     "repository": "${AIC_REPOSITORY}",
@@ -193,6 +194,15 @@ cat > "$OUTPUT_MANIFEST" <<EOF
     "session_manager": "wireplumber",
     "hfp_backend": "native",
     "automatic_headset_profile": true
+  },
+  "desktop": {
+    "xfce_panel_plugin": true,
+    "xfce_multimedia_keys": true,
+    "xfce_panel_order_right_to_left": [
+      "clock", "separator", "actions-full-name", "separator",
+      "pulseaudio", "network", "bluetooth", "separator", "workspace-switcher"
+    ],
+    "hidden_volume_labels": ["BOOT_EMMC", "ROOTFS_EMMC"]
   },
   "boot": {
     "source_partition_sha256": "${BOOT_PARTITION_SHA_BEFORE}",

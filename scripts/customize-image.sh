@@ -237,7 +237,7 @@ if ! chroot_exec "apt-cache show '${HEADER_INSTALL_ARGUMENT}' 2>/dev/null | grep
     [[ "$(dpkg-deb --field "${ROOT_MOUNT}/tmp/${HEADER_FILENAME}" Architecture)" == arm64 ]]
     HEADER_INSTALL_ARGUMENT="/tmp/${HEADER_FILENAME}"
 fi
-chroot_exec "apt-get install -y --no-install-recommends '${HEADER_INSTALL_ARGUMENT}' dkms build-essential mokutil eject usb-modeswitch bluez pipewire-audio pavucontrol python3"
+chroot_exec "apt-get install -y --no-install-recommends '${HEADER_INSTALL_ARGUMENT}' dkms build-essential mokutil eject usb-modeswitch bluez pipewire-audio pavucontrol python3 xfce4-pulseaudio-plugin"
 
 chroot_exec "test -r '/lib/modules/${KERNEL_RELEASE}/build/Makefile'" || {
     echo "Kernel build tree is missing for ${KERNEL_RELEASE}" >&2
@@ -263,6 +263,11 @@ chroot_exec "dkms build -m aic8800 -v 1.0.0 -k '${KERNEL_RELEASE}'"
 chroot_exec "dkms install -m aic8800 -v 1.0.0 -k '${KERNEL_RELEASE}'"
 
 cp -a "${OVERLAY_DIR}/." "$ROOT_MOUNT/"
+XFCE_PANEL_LAYOUTS=(
+    "${ROOT_MOUNT}/etc/skel/.config/xfce4/xfconf/xfce-perchannel-xml/xfce4-panel.xml"
+    "${ROOT_MOUNT}/etc/xdg/xfce4/panel/default.xml"
+)
+python3 /workspace/scripts/configure-xfce-pulseaudio.py "${XFCE_PANEL_LAYOUTS[@]}"
 chmod 0755 \
     "${ROOT_MOUNT}/usr/local/sbin/aic8800-pandora-switch" \
     "${ROOT_MOUNT}/usr/local/bin/aic8800-audio-diagnose"
@@ -286,6 +291,10 @@ grep -Eq 'MessageContent2="[0-9a-fA-F]*f2"' "${ROOT_MOUNT}/etc/usb_modeswitch.d/
 grep -q 'bluetooth.autoswitch-to-headset-profile = true' "${ROOT_MOUNT}/etc/wireplumber/wireplumber.conf.d/60-aic8800-bluetooth.conf"
 grep -Fqx 'blacklist aic8800_btusb' "${ROOT_MOUNT}/etc/modprobe.d/blacklist-aic8800-btusb.conf"
 grep -Fqx 'install aic8800_btusb /bin/false' "${ROOT_MOUNT}/etc/modprobe.d/blacklist-aic8800-btusb.conf"
+udevadm verify "${ROOT_MOUNT}/etc/udev/rules.d/99-hide-emmc-volumes.rules"
+grep -Fqx 'ENV{ID_FS_LABEL}=="BOOT_EMMC", ENV{UDISKS_IGNORE}="1"' "${ROOT_MOUNT}/etc/udev/rules.d/99-hide-emmc-volumes.rules"
+grep -Fqx 'ENV{ID_FS_LABEL}=="ROOTFS_EMMC", ENV{UDISKS_IGNORE}="1"' "${ROOT_MOUNT}/etc/udev/rules.d/99-hide-emmc-volumes.rules"
+python3 /workspace/scripts/configure-xfce-pulseaudio.py --check "${XFCE_PANEL_LAYOUTS[@]}"
 chroot_exec "dpkg-query -W bluez pipewire-audio libspa-0.2-bluetooth wireplumber >/dev/null"
 if chroot_exec "dpkg-query -W -f='\${db:Status-Abbrev}' pulseaudio-module-bluetooth 2>/dev/null | grep -q '^ii'"; then
     echo "Competing PulseAudio Bluetooth module is installed" >&2
@@ -304,6 +313,7 @@ USB_MODESWITCH_VERSION="$(chroot "$ROOT_MOUNT" dpkg-query -W -f='${Version}' usb
 BLUEZ_VERSION="$(chroot "$ROOT_MOUNT" dpkg-query -W -f='${Version}' bluez)"
 PIPEWIRE_AUDIO_VERSION="$(chroot "$ROOT_MOUNT" dpkg-query -W -f='${Version}' pipewire-audio)"
 WIREPLUMBER_VERSION="$(chroot "$ROOT_MOUNT" dpkg-query -W -f='${Version}' wireplumber)"
+XFCE_PULSEAUDIO_PLUGIN_VERSION="$(chroot "$ROOT_MOUNT" dpkg-query -W -f='${Version}' xfce4-pulseaudio-plugin)"
 
 chroot_exec "apt-get clean"
 rm -rf "${ROOT_MOUNT}/var/lib/apt/lists"/* "${ROOT_MOUNT}/tmp"/* "${ROOT_MOUNT}/var/tmp"/*
@@ -359,6 +369,7 @@ USB_MODESWITCH_VERSION='${USB_MODESWITCH_VERSION}'
 BLUEZ_VERSION='${BLUEZ_VERSION}'
 PIPEWIRE_AUDIO_VERSION='${PIPEWIRE_AUDIO_VERSION}'
 WIREPLUMBER_VERSION='${WIREPLUMBER_VERSION}'
+XFCE_PULSEAUDIO_PLUGIN_VERSION='${XFCE_PULSEAUDIO_PLUGIN_VERSION}'
 UBOOT_EXT_SOURCE='u-boot-s905x-s912'
 UBOOT_EXT_SHA256='${UBOOT_EXT_SHA256}'
 BOOT_PARTITION_SHA_BEFORE='${BOOT_PARTITION_SHA_BEFORE}'

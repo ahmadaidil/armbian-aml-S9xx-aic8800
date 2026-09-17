@@ -9,6 +9,13 @@ The resulting image includes:
 - its firmware, udev rules, and Pandora `1111:1111` to `a69c:8d80` switch;
 - a systemd/udev fallback that retries the upstream F3/F2 sequence;
 - BlueZ and PipeWire/WirePlumber native HFP headset microphone support;
+- the XFCE PulseAudio panel plugin backed by `pipewire-pulse`, with volume and
+  media-player multimedia keys explicitly enabled;
+- a default XFCE right-side panel ordered as Clock, separator, Full Name
+  Session Menu, separator, PulseAudio, Network/Bluetooth tray, separator, and
+  Workspace Switcher when read from right to left;
+- targeted UDisks rules that hide `BOOT_EMMC` and `ROOTFS_EMMC` from desktop
+  icons and Thunar while leaving other removable storage visible;
 - the standard kernel `btusb` transport, with the silent legacy
   `aic8800_btusb` transport explicitly blocked;
 - the B860H/S905X SD chainloader installed as `/u-boot.ext`;

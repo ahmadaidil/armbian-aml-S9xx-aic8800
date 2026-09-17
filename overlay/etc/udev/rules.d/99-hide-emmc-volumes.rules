@@ -1,0 +1,4 @@
+# Keep the box's internal Android/eMMC partitions out of UDisks clients such
+# as the XFCE desktop and Thunar, without hiding removable SD/USB storage.
+ENV{ID_FS_LABEL}=="BOOT_EMMC", ENV{UDISKS_IGNORE}="1"
+ENV{ID_FS_LABEL}=="ROOTFS_EMMC", ENV{UDISKS_IGNORE}="1"
