@@ -189,12 +189,19 @@ cat > "$OUTPUT_MANIFEST" <<EOF
   },
   "bluetooth_audio": {
     "transport": "btusb",
+    "legacy_aic8800_btusb_blocked": true,
     "session_manager": "wireplumber",
     "hfp_backend": "native",
     "automatic_headset_profile": true
   },
   "boot": {
-    "official_partition_preserved": true,
+    "source_partition_sha256": "${BOOT_PARTITION_SHA_BEFORE}",
+    "customized_partition_sha256": "${BOOT_PARTITION_SHA_AFTER}",
+    "sd_chainloader": "u-boot.ext",
+    "sd_chainloader_source": "${UBOOT_EXT_SOURCE}",
+    "sd_chainloader_sha256": "${UBOOT_EXT_SHA256}",
+    "dtb": "amlogic/meson-gxl-s905x-p212.dtb",
+    "all_other_boot_files_preserved": true,
     "kernel_and_dtb_preserved": true,
     "initramfs_preserved": true
   },

@@ -19,6 +19,10 @@ BOOT_DEVICE=""
 ROOT_MOUNTED=false
 BOOT_MOUNTED=false
 BOOT_PARTITION_SHA_BEFORE=""
+BOOT_PARTITION_SHA_AFTER=""
+BOOT_FILES_SHA_BEFORE="${MOUNT_BASE}/boot-files.before.sha256"
+BOOT_FILES_SHA_AFTER="${MOUNT_BASE}/boot-files.after.sha256"
+UBOOT_EXT_SHA256=""
 RESOLV_REPLACED=false
 RESOLV_BACKUP="${MOUNT_BASE}/resolv.conf.original"
 
@@ -71,13 +75,17 @@ for partition in "${PARTITIONS[@]}"; do
 done
 
 [[ -n "$ROOT_DEVICE" ]] || { echo "Could not identify the Armbian root partition" >&2; exit 1; }
+[[ -n "$BOOT_DEVICE" ]] || { echo "Could not identify the Armbian boot partition" >&2; exit 1; }
 
 mount "$ROOT_DEVICE" "$ROOT_MOUNT"
 ROOT_MOUNTED=true
 available_bytes="$(df --output=avail --block-size=1 "$ROOT_MOUNT" | tail -1 | tr -d ' ')"
-required_bytes=$((2 * 1024 * 1024 * 1024))
+# The current official desktop image has enough room for the retained DKMS
+# toolchain. Avoid changing its MBR geometry unless space is genuinely tight;
+# some vendor Amlogic boot chains are sensitive to partition-table changes.
+required_bytes=$((512 * 1024 * 1024))
 if ((available_bytes < required_bytes)); then
-    deficit_bytes=$((required_bytes - available_bytes + 512 * 1024 * 1024))
+    deficit_bytes=$((required_bytes - available_bytes + 256 * 1024 * 1024))
     add_mib=$(((deficit_bytes + 1024 * 1024 - 1) / 1024 / 1024))
     root_partition_number="${ROOT_DEVICE#${LOOP_DEVICE}p}"
     [[ "$root_partition_number" =~ ^[0-9]+$ ]] || {
@@ -115,6 +123,10 @@ if [[ -n "$BOOT_DEVICE" ]]; then
     BOOT_PARTITION_SHA_BEFORE="$(sha256sum "$BOOT_DEVICE" | awk '{print $1}')"
     mount -o ro "$BOOT_DEVICE" "${ROOT_MOUNT}/boot"
     BOOT_MOUNTED=true
+    (
+        cd "${ROOT_MOUNT}/boot"
+        find . -type f ! -name 'u-boot.ext' -print0 | sort -z | xargs -0 sha256sum
+    ) > "$BOOT_FILES_SHA_BEFORE"
 fi
 
 # shellcheck disable=SC1091
@@ -272,6 +284,8 @@ grep -q '1111.*1111' "${ROOT_MOUNT}/usr/lib/udev/rules.d/aic.rules"
 grep -Eq 'MessageContent="[0-9a-fA-F]*f3"' "${ROOT_MOUNT}/etc/usb_modeswitch.d/1111:1111"
 grep -Eq 'MessageContent2="[0-9a-fA-F]*f2"' "${ROOT_MOUNT}/etc/usb_modeswitch.d/1111:1111"
 grep -q 'bluetooth.autoswitch-to-headset-profile = true' "${ROOT_MOUNT}/etc/wireplumber/wireplumber.conf.d/60-aic8800-bluetooth.conf"
+grep -Fqx 'blacklist aic8800_btusb' "${ROOT_MOUNT}/etc/modprobe.d/blacklist-aic8800-btusb.conf"
+grep -Fqx 'install aic8800_btusb /bin/false' "${ROOT_MOUNT}/etc/modprobe.d/blacklist-aic8800-btusb.conf"
 chroot_exec "dpkg-query -W bluez pipewire-audio libspa-0.2-bluetooth wireplumber >/dev/null"
 if chroot_exec "dpkg-query -W -f='\${db:Status-Abbrev}' pulseaudio-module-bluetooth 2>/dev/null | grep -q '^ii'"; then
     echo "Competing PulseAudio Bluetooth module is installed" >&2
@@ -296,6 +310,40 @@ rm -rf "${ROOT_MOUNT}/var/lib/apt/lists"/* "${ROOT_MOUNT}/tmp"/* "${ROOT_MOUNT}/
 restore_policy
 trap cleanup EXIT
 
+if [[ "$RESOLV_REPLACED" == true ]]; then
+    rm -f "${ROOT_MOUNT}/etc/resolv.conf"
+    cp -a "$RESOLV_BACKUP" "${ROOT_MOUNT}/etc/resolv.conf"
+    RESOLV_REPLACED=false
+fi
+for bind_path in run sys proc dev/pts dev; do
+    mountpoint -q "${ROOT_MOUNT}/${bind_path}" && umount -l "${ROOT_MOUNT}/${bind_path}"
+done
+if [[ "$BOOT_MOUNTED" == true ]]; then
+    umount "${ROOT_MOUNT}/boot"
+    BOOT_MOUNTED=false
+
+    # The official boot partition is read-only throughout package and DKMS
+    # installation. Remount it writable only for the targeted B860H SD fix.
+    mount "$BOOT_DEVICE" "${ROOT_MOUNT}/boot"
+    BOOT_MOUNTED=true
+    bash /workspace/scripts/configure-b860h-sd-boot.sh "${ROOT_MOUNT}/boot"
+    UBOOT_EXT_SHA256="$(sha256sum "${ROOT_MOUNT}/boot/u-boot.ext" | awk '{print $1}')"
+    [[ "$UBOOT_EXT_SHA256" == "$(sha256sum "${ROOT_MOUNT}/boot/u-boot-s905x-s912" | awk '{print $1}')" ]]
+    (
+        cd "${ROOT_MOUNT}/boot"
+        find . -type f ! -name 'u-boot.ext' -print0 | sort -z | xargs -0 sha256sum
+    ) > "$BOOT_FILES_SHA_AFTER"
+    cmp -s "$BOOT_FILES_SHA_BEFORE" "$BOOT_FILES_SHA_AFTER" || {
+        echo "A boot file other than u-boot.ext changed during customization" >&2
+        diff -u "$BOOT_FILES_SHA_BEFORE" "$BOOT_FILES_SHA_AFTER" || true
+        exit 1
+    }
+    sync -f "${ROOT_MOUNT}/boot"
+    umount "${ROOT_MOUNT}/boot"
+    BOOT_MOUNTED=false
+    BOOT_PARTITION_SHA_AFTER="$(sha256sum "$BOOT_DEVICE" | awk '{print $1}')"
+fi
+
 cat > "$RESULT_ENV" <<EOF
 DISTRO_ID='${ID}'
 DISTRO_VERSION='${VERSION_ID}'
@@ -311,26 +359,12 @@ USB_MODESWITCH_VERSION='${USB_MODESWITCH_VERSION}'
 BLUEZ_VERSION='${BLUEZ_VERSION}'
 PIPEWIRE_AUDIO_VERSION='${PIPEWIRE_AUDIO_VERSION}'
 WIREPLUMBER_VERSION='${WIREPLUMBER_VERSION}'
+UBOOT_EXT_SOURCE='u-boot-s905x-s912'
+UBOOT_EXT_SHA256='${UBOOT_EXT_SHA256}'
+BOOT_PARTITION_SHA_BEFORE='${BOOT_PARTITION_SHA_BEFORE}'
+BOOT_PARTITION_SHA_AFTER='${BOOT_PARTITION_SHA_AFTER}'
 EOF
 
-if [[ "$RESOLV_REPLACED" == true ]]; then
-    rm -f "${ROOT_MOUNT}/etc/resolv.conf"
-    cp -a "$RESOLV_BACKUP" "${ROOT_MOUNT}/etc/resolv.conf"
-    RESOLV_REPLACED=false
-fi
-for bind_path in run sys proc dev/pts dev; do
-    mountpoint -q "${ROOT_MOUNT}/${bind_path}" && umount -l "${ROOT_MOUNT}/${bind_path}"
-done
-if [[ "$BOOT_MOUNTED" == true ]]; then
-    sync -f "${ROOT_MOUNT}/boot"
-    umount "${ROOT_MOUNT}/boot"
-    BOOT_MOUNTED=false
-    BOOT_PARTITION_SHA_AFTER="$(sha256sum "$BOOT_DEVICE" | awk '{print $1}')"
-    [[ "$BOOT_PARTITION_SHA_AFTER" == "$BOOT_PARTITION_SHA_BEFORE" ]] || {
-        echo "Official boot partition changed during customization" >&2
-        exit 1
-    }
-fi
 umount "$ROOT_MOUNT"
 ROOT_MOUNTED=false
 e2fsck -f -y "$ROOT_DEVICE"

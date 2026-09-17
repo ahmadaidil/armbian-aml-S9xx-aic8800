@@ -9,10 +9,16 @@ The resulting image includes:
 - its firmware, udev rules, and Pandora `1111:1111` to `a69c:8d80` switch;
 - a systemd/udev fallback that retries the upstream F3/F2 sequence;
 - BlueZ and PipeWire/WirePlumber native HFP headset microphone support;
+- the standard kernel `btusb` transport, with the silent legacy
+  `aic8800_btusb` transport explicitly blocked;
+- the B860H/S905X SD chainloader installed as `/u-boot.ext`;
 - `aic8800-audio-diagnose` for post-flash Bluetooth and microphone checks.
 
-The official boot partition, bootloader, kernel, DTBs, and initramfs are kept
-unchanged. The driver modules load from the root filesystem after it is mounted.
+The image keeps the official kernel, DTBs, initramfs, disk geometry, and
+partition table. The sole boot-file addition is an exact copy of the official
+`u-boot-s905x-s912` binary named `u-boot.ext`, which the existing official
+`s905_autoscript` already attempts to load from SD. Every other boot file is
+hashed before and after customization and must remain unchanged.
 
 ## Build
 
