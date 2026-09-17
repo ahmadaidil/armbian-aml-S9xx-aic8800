@@ -1,0 +1,4 @@
+# Let the upstream aic.rules handler run first. If 1111:1111 remains,
+# systemd starts the locked and retrying fallback service.
+ACTION=="add", SUBSYSTEM=="usb", ATTR{idVendor}=="1111", ATTR{idProduct}=="1111", TAG+="systemd", ENV{SYSTEMD_WANTS}+="aic8800-pandora-fallback.service"
+

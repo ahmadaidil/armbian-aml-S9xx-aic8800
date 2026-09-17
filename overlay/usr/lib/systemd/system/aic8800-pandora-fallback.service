@@ -1,0 +1,13 @@
+[Unit]
+Description=AIC8800 Pandora USB mode-switch fallback
+Documentation=https://github.com/shenmintao/aic8800d80#pandora-88m80-mode-switching
+After=systemd-udevd.service
+
+[Service]
+Type=oneshot
+ExecStartPre=/bin/sleep 3
+ExecStart=/usr/local/sbin/aic8800-pandora-switch
+
+[Install]
+WantedBy=multi-user.target
+

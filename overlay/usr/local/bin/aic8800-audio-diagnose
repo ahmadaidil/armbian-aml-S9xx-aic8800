@@ -1,0 +1,115 @@
+#!/usr/bin/env bash
+set -u
+
+usage() {
+    cat <<'EOF'
+Usage: aic8800-audio-diagnose [--record [SECONDS] [OUTPUT.wav]]
+
+Run as the logged-in desktop user, not with sudo. Without --record the command
+is read-only. Recording uses the first Bluetooth source, or the default source.
+EOF
+}
+
+record=false
+seconds=5
+output="${PWD}/aic8800-microphone-test.wav"
+if [[ ${1:-} == --record ]]; then
+    record=true
+    [[ ${2:-} =~ ^[1-9][0-9]*$ ]] && seconds="$2"
+    if [[ -n ${3:-} ]]; then
+        output="$3"
+    elif [[ -n ${2:-} && ! ${2:-} =~ ^[1-9][0-9]*$ ]]; then
+        output="$2"
+    fi
+elif [[ $# -gt 0 ]]; then
+    usage >&2
+    exit 2
+fi
+
+section() { printf '\n== %s ==\n' "$1"; }
+
+section "USB AIC/Pandora devices"
+lsusb 2>/dev/null | grep -Ei '1111:1111|a69c:|368b:' || echo "No matching USB device found"
+
+section "Kernel modules"
+lsmod 2>/dev/null | grep -E '^(aic|btusb)' || echo "No AIC/btusb modules currently loaded"
+
+section "USB controller driver bindings"
+binding_found=false
+for device_path in /sys/bus/usb/devices/*; do
+    [[ -r "$device_path/idVendor" && -r "$device_path/idProduct" ]] || continue
+    vendor="$(<"$device_path/idVendor")"
+    product="$(<"$device_path/idProduct")"
+    case "${vendor}:${product}" in
+        1111:1111|a69c:*|368b:*) ;;
+        *) continue ;;
+    esac
+    binding_found=true
+    driver="unbound"
+    [[ -L "$device_path/driver" ]] && driver="$(basename "$(readlink "$device_path/driver")")"
+    printf '%s  sysfs=%s  driver=%s\n' "${vendor}:${product}" "$(basename "$device_path")" "$driver"
+done
+[[ "$binding_found" == true ]] || echo "No matching USB controller binding found"
+
+section "Bluetooth service and controllers"
+systemctl is-active bluetooth.service 2>/dev/null || true
+bluetoothctl list 2>/dev/null || true
+bluetoothctl show 2>/dev/null || true
+
+section "PipeWire / WirePlumber"
+wpctl status -n 2>/dev/null || echo "PipeWire user session is unavailable"
+
+section "Bluetooth cards and input sources"
+pactl list cards short 2>/dev/null || true
+pactl list sources short 2>/dev/null || true
+
+section "Input mute and volume"
+default_source="$(pactl get-default-source 2>/dev/null || true)"
+printf 'Default source: %s\n' "${default_source:-unavailable}"
+while read -r source_name; do
+    [[ -n "$source_name" ]] || continue
+    printf '%s\n' "Source: $source_name"
+    pactl get-source-mute "$source_name" 2>/dev/null || true
+    pactl get-source-volume "$source_name" 2>/dev/null || true
+done < <(pactl list sources short 2>/dev/null | awk '$2 ~ /^bluez_input/ {print $2}')
+if [[ -n "$default_source" && "$default_source" != bluez_input* ]]; then
+    pactl get-source-mute "$default_source" 2>/dev/null || true
+    pactl get-source-volume "$default_source" 2>/dev/null || true
+fi
+
+if [[ "$record" != true ]]; then
+    exit 0
+fi
+
+source_name="$(pactl list sources short 2>/dev/null | awk '$2 ~ /^bluez_input/ {print $2; exit}')"
+if [[ -z "$source_name" ]]; then
+    source_name="$(pactl get-default-source 2>/dev/null || true)"
+fi
+[[ -n "$source_name" ]] || { echo "No microphone source is available" >&2; exit 1; }
+
+section "Recording ${seconds}s from ${source_name}"
+rm -f "$output"
+set +e
+timeout --signal=INT "${seconds}s" pw-record \
+    --target "$source_name" --format s16 --rate 16000 --channels 1 "$output"
+record_status=$?
+set -e
+[[ $record_status -eq 0 || $record_status -eq 124 || $record_status -eq 130 ]] || exit "$record_status"
+[[ -s "$output" ]] || { echo "Recording file is empty" >&2; exit 1; }
+
+python3 - "$output" <<'PY'
+import struct
+import sys
+import wave
+
+path = sys.argv[1]
+with wave.open(path, "rb") as wav:
+    frames = wav.readframes(wav.getnframes())
+samples = struct.unpack("<%dh" % (len(frames) // 2), frames) if frames else ()
+peak = max((abs(value) for value in samples), default=0)
+nonzero = sum(value != 0 for value in samples)
+print(f"Recorded {len(samples)} samples; nonzero={nonzero}; peak={peak}; file={path}")
+if peak == 0:
+    print("FAIL: microphone capture is silent", file=sys.stderr)
+    raise SystemExit(2)
+PY

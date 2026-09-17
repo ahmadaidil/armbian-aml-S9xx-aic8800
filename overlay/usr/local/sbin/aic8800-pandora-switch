@@ -1,0 +1,78 @@
+#!/bin/sh
+set -eu
+
+SYSFS_ROOT="${AIC_SYSFS_ROOT:-/sys}"
+MODE_SWITCH_CONFIG="${AIC_MODE_SWITCH_CONFIG:-/etc/usb_modeswitch.d/1111:1111}"
+LOCK_FILE="${AIC_LOCK_FILE:-/run/lock/aic8800-pandora-switch.lock}"
+RETRIES="${AIC_RETRIES:-3}"
+POLL_ATTEMPTS="${AIC_POLL_ATTEMPTS:-10}"
+POLL_DELAY="${AIC_POLL_DELAY:-1}"
+
+log() {
+    printf '%s\n' "aic8800-pandora-switch: $*"
+    if command -v logger >/dev/null 2>&1; then
+        logger -t aic8800-pandora-switch -- "$*" || true
+    fi
+}
+
+device_present() {
+    wanted_vendor="$1"
+    wanted_product="$2"
+    for device_path in "$SYSFS_ROOT"/bus/usb/devices/*; do
+        [ -r "$device_path/idVendor" ] || continue
+        [ -r "$device_path/idProduct" ] || continue
+        [ "$(cat "$device_path/idVendor")" = "$wanted_vendor" ] || continue
+        [ "$(cat "$device_path/idProduct")" = "$wanted_product" ] || continue
+        return 0
+    done
+    return 1
+}
+
+find_usb_modeswitch() {
+    if [ -n "${AIC_USB_MODESWITCH:-}" ]; then
+        printf '%s\n' "$AIC_USB_MODESWITCH"
+    elif [ -x /usr/sbin/usb_modeswitch ]; then
+        printf '%s\n' /usr/sbin/usb_modeswitch
+    elif [ -x /usr/bin/usb_modeswitch ]; then
+        printf '%s\n' /usr/bin/usb_modeswitch
+    else
+        return 1
+    fi
+}
+
+mkdir -p "$(dirname "$LOCK_FILE")"
+exec 9>"$LOCK_FILE"
+flock -w 30 9 || { log "another mode-switch operation did not finish"; exit 1; }
+
+if ! device_present 1111 1111; then
+    exit 0
+fi
+
+USB_MODESWITCH="$(find_usb_modeswitch)" || { log "usb_modeswitch is unavailable"; exit 1; }
+[ -r "$MODE_SWITCH_CONFIG" ] || { log "missing configuration: $MODE_SWITCH_CONFIG"; exit 1; }
+
+attempt=1
+while [ "$attempt" -le "$RETRIES" ]; do
+    if device_present a69c 8d80; then
+        exit 0
+    fi
+    if ! device_present 1111 1111; then
+        break
+    fi
+    log "Pandora 1111:1111 detected; running F3/F2 mode switch (attempt $attempt/$RETRIES)"
+    "$USB_MODESWITCH" -c "$MODE_SWITCH_CONFIG" || true
+
+    poll=1
+    while [ "$poll" -le "$POLL_ATTEMPTS" ]; do
+        if device_present a69c 8d80; then
+            log "Pandora adapter enumerated as AIC a69c:8d80"
+            exit 0
+        fi
+        sleep "$POLL_DELAY"
+        poll=$((poll + 1))
+    done
+    attempt=$((attempt + 1))
+done
+
+log "Pandora adapter did not enumerate as AIC a69c:8d80 after $RETRIES attempts"
+exit 1
