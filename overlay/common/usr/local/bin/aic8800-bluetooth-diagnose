@@ -1,0 +1,59 @@
+#!/usr/bin/env bash
+set -u
+
+section() { printf '\n== %s ==\n' "$1"; }
+
+section "USB AIC/Pandora devices"
+if command -v lsusb >/dev/null 2>&1; then
+    lsusb 2>/dev/null | grep -Ei '1111:1111|a69c:|368b:' || echo "No matching USB device found"
+else
+    echo "lsusb is unavailable"
+fi
+
+section "Kernel modules"
+lsmod 2>/dev/null | grep -E '^(aic|btusb)' || echo "No AIC/btusb modules currently loaded"
+for module_name in aic8800_fdrv aic_load_fw aic_zlp_quirk btusb; do
+    if modinfo "$module_name" >/dev/null 2>&1; then
+        printf '%s: file=%s vermagic=%s\n' "$module_name" \
+            "$(modinfo -F filename "$module_name" 2>/dev/null)" \
+            "$(modinfo -F vermagic "$module_name" 2>/dev/null)"
+    else
+        printf '%s: unavailable\n' "$module_name"
+    fi
+done
+
+section "AIC firmware"
+find /lib/firmware -maxdepth 1 -type d -name 'aic8800*' -print 2>/dev/null \
+    | sort || true
+
+section "USB controller driver bindings"
+binding_found=false
+for device_path in /sys/bus/usb/devices/*; do
+    [[ -r "$device_path/idVendor" && -r "$device_path/idProduct" ]] || continue
+    vendor="$(<"$device_path/idVendor")"
+    product="$(<"$device_path/idProduct")"
+    case "${vendor}:${product}" in
+        1111:1111|a69c:*|368b:*) ;;
+        *) continue ;;
+    esac
+    binding_found=true
+    driver="unbound"
+    [[ -L "$device_path/driver" ]] && driver="$(basename "$(readlink "$device_path/driver")")"
+    printf '%s  sysfs=%s  driver=%s\n' "${vendor}:${product}" "$(basename "$device_path")" "$driver"
+    for interface_path in "${device_path}":*; do
+        [[ -e "$interface_path" ]] || continue
+        interface_driver="unbound"
+        [[ -L "$interface_path/driver" ]] && interface_driver="$(basename "$(readlink "$interface_path/driver")")"
+        printf '  interface=%s  driver=%s\n' "$(basename "$interface_path")" "$interface_driver"
+    done
+done
+[[ "$binding_found" == true ]] || echo "No matching USB controller binding found"
+
+section "Radio state"
+rfkill list bluetooth 2>/dev/null || echo "No Bluetooth rfkill entry found"
+
+section "Bluetooth service and controllers"
+systemctl is-enabled bluetooth.service 2>/dev/null || true
+systemctl is-active bluetooth.service 2>/dev/null || true
+bluetoothctl list 2>/dev/null || true
+bluetoothctl show 2>/dev/null || true

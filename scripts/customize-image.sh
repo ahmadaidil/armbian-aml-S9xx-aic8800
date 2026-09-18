@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-if [[ $# -ne 4 ]]; then
-    echo "Usage: customize-image.sh IMAGE DRIVER_DIR OVERLAY_DIR RESULT_ENV" >&2
+if [[ $# -ne 6 ]]; then
+    echo "Usage: customize-image.sh IMAGE DRIVER_DIR OVERLAY_DIR RESULT_ENV VARIANT BLUETOOTH_AUDIO" >&2
     exit 2
 fi
 
@@ -10,6 +10,37 @@ IMAGE_PATH="$1"
 DRIVER_DIR="$2"
 OVERLAY_DIR="$3"
 RESULT_ENV="$4"
+VARIANT="$5"
+BLUETOOTH_AUDIO="$6"
+COMMON_OVERLAY_DIR="${OVERLAY_DIR}/common"
+AUDIO_OVERLAY_DIR="${OVERLAY_DIR}/audio"
+
+case "$VARIANT" in
+    xfce)
+        EXPECTED_DISTRO_ID="ubuntu"
+        EXPECTED_DISTRO_VERSION="26.04"
+        ;;
+    minimal)
+        EXPECTED_DISTRO_ID="debian"
+        EXPECTED_DISTRO_VERSION="13"
+        ;;
+    *)
+        echo "Invalid variant: $VARIANT" >&2
+        exit 2
+        ;;
+esac
+[[ "$BLUETOOTH_AUDIO" == true || "$BLUETOOTH_AUDIO" == false ]] || {
+    echo "BLUETOOTH_AUDIO must be true or false" >&2
+    exit 2
+}
+if [[ "$VARIANT" == xfce && "$BLUETOOTH_AUDIO" != true ]]; then
+    echo "The XFCE profile requires Bluetooth audio" >&2
+    exit 2
+fi
+[[ -d "$COMMON_OVERLAY_DIR" && -d "$AUDIO_OVERLAY_DIR" ]] || {
+    echo "Expected common and audio overlay directories under $OVERLAY_DIR" >&2
+    exit 1
+}
 MOUNT_BASE="$(mktemp -d /tmp/armbian-aic.XXXXXX)"
 ROOT_MOUNT="${MOUNT_BASE}/root"
 PROBE_MOUNT="${MOUNT_BASE}/probe"
@@ -37,9 +68,9 @@ cleanup() {
     for bind_path in run sys proc dev/pts dev; do
         mountpoint -q "${ROOT_MOUNT}/${bind_path}" && umount -l "${ROOT_MOUNT}/${bind_path}"
     done
-    [[ "$BOOT_MOUNTED" == true ]] && umount "${ROOT_MOUNT}/boot"
-    [[ "$ROOT_MOUNTED" == true ]] && umount "$ROOT_MOUNT"
-    mountpoint -q "$PROBE_MOUNT" && umount "$PROBE_MOUNT"
+    [[ "$BOOT_MOUNTED" == true ]] && umount -l "${ROOT_MOUNT}/boot"
+    [[ "$ROOT_MOUNTED" == true ]] && umount -l "$ROOT_MOUNT"
+    mountpoint -q "$PROBE_MOUNT" && umount -l "$PROBE_MOUNT"
     [[ -n "$LOOP_DEVICE" ]] && losetup -d "$LOOP_DEVICE"
     rm -rf "$MOUNT_BASE"
 }
@@ -83,7 +114,13 @@ available_bytes="$(df --output=avail --block-size=1 "$ROOT_MOUNT" | tail -1 | tr
 # The current official desktop image has enough room for the retained DKMS
 # toolchain. Avoid changing its MBR geometry unless space is genuinely tight;
 # some vendor Amlogic boot chains are sensitive to partition-table changes.
-required_bytes=$((512 * 1024 * 1024))
+# Audio packages and their dependencies consume additional temporary space
+# before apt caches and the DKMS build tree are cleaned.
+required_mib=512
+if [[ "$BLUETOOTH_AUDIO" == true ]]; then
+    required_mib=768
+fi
+required_bytes=$((required_mib * 1024 * 1024))
 if ((available_bytes < required_bytes)); then
     deficit_bytes=$((required_bytes - available_bytes + 256 * 1024 * 1024))
     add_mib=$(((deficit_bytes + 1024 * 1024 - 1) / 1024 / 1024))
@@ -131,8 +168,8 @@ fi
 
 # shellcheck disable=SC1091
 source "${ROOT_MOUNT}/etc/os-release"
-[[ "${ID:-}" == ubuntu && "${VERSION_ID:-}" == 26.04 ]] || {
-    echo "Expected Ubuntu 26.04, found ${ID:-unknown} ${VERSION_ID:-unknown}" >&2
+[[ "${ID:-}" == "$EXPECTED_DISTRO_ID" && "${VERSION_ID:-}" == "$EXPECTED_DISTRO_VERSION" ]] || {
+    echo "Expected ${EXPECTED_DISTRO_ID} ${EXPECTED_DISTRO_VERSION}, found ${ID:-unknown} ${VERSION_ID:-unknown}" >&2
     exit 1
 }
 
@@ -147,8 +184,17 @@ chroot_exec() {
 KERNEL_RELEASE="$(find "${ROOT_MOUNT}/lib/modules" -mindepth 1 -maxdepth 1 -type d -name '*current-meson64*' -printf '%f\n' | sort -V | tail -1)"
 [[ -n "$KERNEL_RELEASE" ]] || { echo "No current-meson64 kernel found in image" >&2; exit 1; }
 
-XFCE_VERSION_BEFORE="$(chroot "$ROOT_MOUNT" dpkg-query -W -f='${Version}' xfce4-session 2>/dev/null || true)"
-[[ -n "$XFCE_VERSION_BEFORE" ]] || { echo "XFCE session package is missing from source image" >&2; exit 1; }
+installed_package_version() {
+    chroot "$ROOT_MOUNT" dpkg-query -W -f='${db:Status-Abbrev} ${Version}\n' "$1" 2>/dev/null \
+        | awk '$1 == "ii" {print $2; exit}' || true
+}
+
+XFCE_VERSION_BEFORE="$(installed_package_version xfce4-session)"
+if [[ "$VARIANT" == xfce ]]; then
+    [[ -n "$XFCE_VERSION_BEFORE" ]] || { echo "XFCE session package is missing from source image" >&2; exit 1; }
+else
+    [[ -z "$XFCE_VERSION_BEFORE" ]] || { echo "Minimal source image unexpectedly contains XFCE" >&2; exit 1; }
+fi
 
 KERNEL_PACKAGE="$(chroot "$ROOT_MOUNT" dpkg-query -W -f='${db:Status-Abbrev} ${binary:Package}\n' 'linux-image*meson64*' 2>/dev/null | awk '$1 == "ii " || $1 == "ii" {print $2; exit}')"
 if [[ -z "$KERNEL_PACKAGE" ]]; then
@@ -191,7 +237,7 @@ restore_policy() {
 }
 trap 'restore_policy; cleanup' EXIT
 
-echo "Installing exact kernel headers and runtime dependencies..."
+echo "Installing exact kernel headers and ${VARIANT} profile dependencies..."
 chroot_exec "apt-get update"
 HEADER_SOURCE="apt"
 HEADER_INSTALL_ARGUMENT="${HEADER_PACKAGE}=${KERNEL_PACKAGE_VERSION}"
@@ -237,7 +283,25 @@ if ! chroot_exec "apt-cache show '${HEADER_INSTALL_ARGUMENT}' 2>/dev/null | grep
     [[ "$(dpkg-deb --field "${ROOT_MOUNT}/tmp/${HEADER_FILENAME}" Architecture)" == arm64 ]]
     HEADER_INSTALL_ARGUMENT="/tmp/${HEADER_FILENAME}"
 fi
-chroot_exec "apt-get install -y --no-install-recommends '${HEADER_INSTALL_ARGUMENT}' dkms build-essential mokutil eject usb-modeswitch bluez pipewire-audio pavucontrol python3 xfce4-pulseaudio-plugin"
+INSTALL_PACKAGES=(
+    "$HEADER_INSTALL_ARGUMENT"
+    dkms
+    build-essential
+    mokutil
+    eject
+    usb-modeswitch
+    usbutils
+    bluez
+    python3
+)
+if [[ "$BLUETOOTH_AUDIO" == true ]]; then
+    INSTALL_PACKAGES+=(pipewire-audio wireplumber pulseaudio-utils)
+fi
+if [[ "$VARIANT" == xfce ]]; then
+    INSTALL_PACKAGES+=(pavucontrol xfce4-pulseaudio-plugin)
+fi
+printf -v INSTALL_PACKAGES_QUOTED ' %q' "${INSTALL_PACKAGES[@]}"
+chroot_exec "apt-get install -y --no-install-recommends${INSTALL_PACKAGES_QUOTED}"
 
 chroot_exec "test -r '/lib/modules/${KERNEL_RELEASE}/build/Makefile'" || {
     echo "Kernel build tree is missing for ${KERNEL_RELEASE}" >&2
@@ -259,19 +323,36 @@ rm -rf "${ROOT_MOUNT}/usr/src/aic8800-1.0.0/.git"
 
 chroot_exec "dkms status -m aic8800 -v 1.0.0 >/dev/null 2>&1 && dkms remove -m aic8800 -v 1.0.0 --all || true"
 chroot_exec "dkms add -m aic8800 -v 1.0.0"
-chroot_exec "dkms build -m aic8800 -v 1.0.0 -k '${KERNEL_RELEASE}'"
+if ! chroot_exec "dkms build -m aic8800 -v 1.0.0 -k '${KERNEL_RELEASE}'"; then
+    echo "AIC DKMS build failed; filesystem and make log follow:" >&2
+    df -h "$ROOT_MOUNT" >&2 || true
+    sed -n '1,240p' "${ROOT_MOUNT}/var/lib/dkms/aic8800/1.0.0/build/make.log" >&2 || true
+    exit 1
+fi
 chroot_exec "dkms install -m aic8800 -v 1.0.0 -k '${KERNEL_RELEASE}'"
 
-cp -a "${OVERLAY_DIR}/." "$ROOT_MOUNT/"
-XFCE_PANEL_LAYOUTS=(
-    "${ROOT_MOUNT}/etc/skel/.config/xfce4/xfconf/xfce-perchannel-xml/xfce4-panel.xml"
-    "${ROOT_MOUNT}/etc/xdg/xfce4/panel/default.xml"
-)
-python3 /workspace/scripts/configure-xfce-pulseaudio.py "${XFCE_PANEL_LAYOUTS[@]}"
+cp -a "${COMMON_OVERLAY_DIR}/." "$ROOT_MOUNT/"
+python3 /workspace/scripts/patch-armbian-firstlogin-wifi.py \
+    "${ROOT_MOUNT}/usr/lib/armbian/armbian-firstlogin"
+if [[ "$BLUETOOTH_AUDIO" == true ]]; then
+    cp -a "${AUDIO_OVERLAY_DIR}/." "$ROOT_MOUNT/"
+fi
+if [[ "$VARIANT" == xfce ]]; then
+    XFCE_PANEL_LAYOUTS=(
+        "${ROOT_MOUNT}/etc/skel/.config/xfce4/xfconf/xfce-perchannel-xml/xfce4-panel.xml"
+        "${ROOT_MOUNT}/etc/xdg/xfce4/panel/default.xml"
+    )
+    python3 /workspace/scripts/configure-xfce-pulseaudio.py "${XFCE_PANEL_LAYOUTS[@]}"
+fi
 chmod 0755 \
     "${ROOT_MOUNT}/usr/local/sbin/aic8800-pandora-switch" \
-    "${ROOT_MOUNT}/usr/local/bin/aic8800-audio-diagnose"
+    "${ROOT_MOUNT}/usr/local/sbin/armbian-firstlogin-wifi-connect" \
+    "${ROOT_MOUNT}/usr/local/bin/aic8800-bluetooth-diagnose"
+if [[ "$BLUETOOTH_AUDIO" == true ]]; then
+    chmod 0755 "${ROOT_MOUNT}/usr/local/bin/aic8800-audio-diagnose"
+fi
 chroot_exec "systemctl enable aic8800-pandora-fallback.service"
+chroot_exec "systemctl enable bluetooth.service"
 chroot_exec "depmod -a '${KERNEL_RELEASE}'"
 
 echo "Verifying customized image..."
@@ -288,32 +369,71 @@ find "${ROOT_MOUNT}/lib/firmware" -maxdepth 1 -type d -name 'aic8800*' -print -q
 grep -q '1111.*1111' "${ROOT_MOUNT}/usr/lib/udev/rules.d/aic.rules"
 grep -Eq 'MessageContent="[0-9a-fA-F]*f3"' "${ROOT_MOUNT}/etc/usb_modeswitch.d/1111:1111"
 grep -Eq 'MessageContent2="[0-9a-fA-F]*f2"' "${ROOT_MOUNT}/etc/usb_modeswitch.d/1111:1111"
-grep -q 'bluetooth.autoswitch-to-headset-profile = true' "${ROOT_MOUNT}/etc/wireplumber/wireplumber.conf.d/60-aic8800-bluetooth.conf"
 grep -Fqx 'blacklist aic8800_btusb' "${ROOT_MOUNT}/etc/modprobe.d/blacklist-aic8800-btusb.conf"
 grep -Fqx 'install aic8800_btusb /bin/false' "${ROOT_MOUNT}/etc/modprobe.d/blacklist-aic8800-btusb.conf"
 udevadm verify "${ROOT_MOUNT}/etc/udev/rules.d/99-hide-emmc-volumes.rules"
 grep -Fqx 'ENV{ID_FS_LABEL}=="BOOT_EMMC", ENV{UDISKS_IGNORE}="1"' "${ROOT_MOUNT}/etc/udev/rules.d/99-hide-emmc-volumes.rules"
 grep -Fqx 'ENV{ID_FS_LABEL}=="ROOTFS_EMMC", ENV{UDISKS_IGNORE}="1"' "${ROOT_MOUNT}/etc/udev/rules.d/99-hide-emmc-volumes.rules"
-python3 /workspace/scripts/configure-xfce-pulseaudio.py --check "${XFCE_PANEL_LAYOUTS[@]}"
-chroot_exec "dpkg-query -W bluez pipewire-audio libspa-0.2-bluetooth wireplumber >/dev/null"
-if chroot_exec "dpkg-query -W -f='\${db:Status-Abbrev}' pulseaudio-module-bluetooth 2>/dev/null | grep -q '^ii'"; then
-    echo "Competing PulseAudio Bluetooth module is installed" >&2
-    exit 1
+chroot_exec "systemctl is-enabled bluetooth.service >/dev/null"
+chroot_exec "dpkg-query -W -f='\${db:Status-Abbrev}' bluez | grep -q '^ii'"
+python3 /workspace/scripts/patch-armbian-firstlogin-wifi.py --check \
+    "${ROOT_MOUNT}/usr/lib/armbian/armbian-firstlogin"
+chroot_exec "bash -n /usr/lib/armbian/armbian-firstlogin"
+chroot_exec "bash -n /usr/local/sbin/armbian-firstlogin-wifi-connect"
+chroot_exec "test -x /usr/local/sbin/armbian-firstlogin-wifi-connect"
+
+if [[ "$BLUETOOTH_AUDIO" == true ]]; then
+    grep -q 'bluetooth.autoswitch-to-headset-profile = true' "${ROOT_MOUNT}/etc/wireplumber/wireplumber.conf.d/60-aic8800-bluetooth.conf"
+    for audio_package in pipewire-audio libspa-0.2-bluetooth wireplumber pulseaudio-utils; do
+        [[ -n "$(installed_package_version "$audio_package")" ]] || {
+            echo "Bluetooth audio profile is missing ${audio_package}" >&2
+            exit 1
+        }
+    done
+    if chroot_exec "dpkg-query -W -f='\${db:Status-Abbrev}' pulseaudio-module-bluetooth 2>/dev/null | grep -q '^ii'"; then
+        echo "Competing PulseAudio Bluetooth module is installed" >&2
+        exit 1
+    fi
+else
+    for absent_package in pipewire-audio wireplumber pavucontrol xfce4-pulseaudio-plugin; do
+        [[ -z "$(installed_package_version "$absent_package")" ]] || {
+            echo "Minimal controller-only profile unexpectedly contains ${absent_package}" >&2
+            exit 1
+        }
+    done
+    [[ ! -e "${ROOT_MOUNT}/etc/wireplumber/wireplumber.conf.d/60-aic8800-bluetooth.conf" ]]
+    [[ ! -e "${ROOT_MOUNT}/usr/local/bin/aic8800-audio-diagnose" ]]
 fi
 
-XFCE_VERSION_AFTER="$(chroot "$ROOT_MOUNT" dpkg-query -W -f='${Version}' xfce4-session)"
-[[ "$XFCE_VERSION_AFTER" == "$XFCE_VERSION_BEFORE" ]] || { echo "XFCE package changed unexpectedly" >&2; exit 1; }
+if [[ "$VARIANT" == xfce ]]; then
+    python3 /workspace/scripts/configure-xfce-pulseaudio.py --check "${XFCE_PANEL_LAYOUTS[@]}"
+    XFCE_VERSION_AFTER="$(installed_package_version xfce4-session)"
+    [[ "$XFCE_VERSION_AFTER" == "$XFCE_VERSION_BEFORE" ]] || { echo "XFCE package changed unexpectedly" >&2; exit 1; }
+else
+    XFCE_VERSION_AFTER=""
+    for desktop_package in xfce4-session xfce4-pulseaudio-plugin pavucontrol; do
+        [[ -z "$(installed_package_version "$desktop_package")" ]] || {
+            echo "Minimal profile unexpectedly contains ${desktop_package}" >&2
+            exit 1
+        }
+    done
+fi
 KERNEL_VERSION_AFTER="$(chroot "$ROOT_MOUNT" dpkg-query -W -f='${Version}' "$KERNEL_PACKAGE")"
 [[ "$KERNEL_VERSION_AFTER" == "$KERNEL_PACKAGE_VERSION" ]] || { echo "Kernel package changed unexpectedly" >&2; exit 1; }
 
-HEADER_PACKAGE_VERSION="$(chroot "$ROOT_MOUNT" dpkg-query -W -f='${Version}' "$HEADER_PACKAGE")"
-DKMS_PACKAGE_VERSION="$(chroot "$ROOT_MOUNT" dpkg-query -W -f='${Version}' dkms)"
-BUILD_ESSENTIAL_VERSION="$(chroot "$ROOT_MOUNT" dpkg-query -W -f='${Version}' build-essential)"
-USB_MODESWITCH_VERSION="$(chroot "$ROOT_MOUNT" dpkg-query -W -f='${Version}' usb-modeswitch)"
-BLUEZ_VERSION="$(chroot "$ROOT_MOUNT" dpkg-query -W -f='${Version}' bluez)"
-PIPEWIRE_AUDIO_VERSION="$(chroot "$ROOT_MOUNT" dpkg-query -W -f='${Version}' pipewire-audio)"
-WIREPLUMBER_VERSION="$(chroot "$ROOT_MOUNT" dpkg-query -W -f='${Version}' wireplumber)"
-XFCE_PULSEAUDIO_PLUGIN_VERSION="$(chroot "$ROOT_MOUNT" dpkg-query -W -f='${Version}' xfce4-pulseaudio-plugin)"
+HEADER_PACKAGE_VERSION="$(installed_package_version "$HEADER_PACKAGE")"
+DKMS_PACKAGE_VERSION="$(installed_package_version dkms)"
+BUILD_ESSENTIAL_VERSION="$(installed_package_version build-essential)"
+USB_MODESWITCH_VERSION="$(installed_package_version usb-modeswitch)"
+USBUTILS_VERSION="$(installed_package_version usbutils)"
+BLUEZ_VERSION="$(installed_package_version bluez)"
+PIPEWIRE_AUDIO_VERSION="$(installed_package_version pipewire-audio)"
+LIBSPA_BLUETOOTH_VERSION="$(installed_package_version libspa-0.2-bluetooth)"
+WIREPLUMBER_VERSION="$(installed_package_version wireplumber)"
+PULSEAUDIO_UTILS_VERSION="$(installed_package_version pulseaudio-utils)"
+PYTHON3_VERSION="$(installed_package_version python3)"
+PAVUCONTROL_VERSION="$(installed_package_version pavucontrol)"
+XFCE_PULSEAUDIO_PLUGIN_VERSION="$(installed_package_version xfce4-pulseaudio-plugin)"
 
 chroot_exec "apt-get clean"
 rm -rf "${ROOT_MOUNT}/var/lib/apt/lists"/* "${ROOT_MOUNT}/tmp"/* "${ROOT_MOUNT}/var/tmp"/*
@@ -366,9 +486,14 @@ HEADER_PACKAGE_VERSION='${HEADER_PACKAGE_VERSION}'
 DKMS_PACKAGE_VERSION='${DKMS_PACKAGE_VERSION}'
 BUILD_ESSENTIAL_VERSION='${BUILD_ESSENTIAL_VERSION}'
 USB_MODESWITCH_VERSION='${USB_MODESWITCH_VERSION}'
+USBUTILS_VERSION='${USBUTILS_VERSION}'
 BLUEZ_VERSION='${BLUEZ_VERSION}'
 PIPEWIRE_AUDIO_VERSION='${PIPEWIRE_AUDIO_VERSION}'
+LIBSPA_BLUETOOTH_VERSION='${LIBSPA_BLUETOOTH_VERSION}'
 WIREPLUMBER_VERSION='${WIREPLUMBER_VERSION}'
+PULSEAUDIO_UTILS_VERSION='${PULSEAUDIO_UTILS_VERSION}'
+PYTHON3_VERSION='${PYTHON3_VERSION}'
+PAVUCONTROL_VERSION='${PAVUCONTROL_VERSION}'
 XFCE_PULSEAUDIO_PLUGIN_VERSION='${XFCE_PULSEAUDIO_PLUGIN_VERSION}'
 UBOOT_EXT_SOURCE='u-boot-s905x-s912'
 UBOOT_EXT_SHA256='${UBOOT_EXT_SHA256}'

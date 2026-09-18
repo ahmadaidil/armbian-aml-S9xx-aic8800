@@ -1,0 +1,114 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+if [[ $# -ne 2 ]]; then
+	echo "Usage: armbian-firstlogin-wifi-connect INTERFACE SSID" >&2
+	exit 2
+fi
+
+INTERFACE="$1"
+SSID="$2"
+NETPLAN_DIR="${ARMBIAN_FIRSTLOGIN_NETPLAN_DIR:-/etc/netplan}"
+CONNECTION_FILE="${NETPLAN_DIR}/30-wifis-dhcp.yaml"
+WAIT_ATTEMPTS="${ARMBIAN_FIRSTLOGIN_WIFI_WAIT_ATTEMPTS:-45}"
+WAIT_DELAY="${ARMBIAN_FIRSTLOGIN_WIFI_WAIT_DELAY:-1}"
+TEMP_FILE=""
+BACKUP_FILE=""
+HAD_PREVIOUS=false
+
+case "$WAIT_ATTEMPTS" in
+	''|*[!0-9]*) echo "Invalid Wi-Fi wait attempt count" >&2; exit 2 ;;
+esac
+
+# Read the passphrase from stdin so it never appears in the process arguments.
+PASSWORD=""
+IFS= read -r -d '' PASSWORD || true
+
+cleanup() {
+	[[ -z "$TEMP_FILE" ]] || rm -f -- "$TEMP_FILE"
+	[[ -z "$BACKUP_FILE" ]] || rm -f -- "$BACKUP_FILE"
+}
+trap cleanup EXIT
+
+rollback() {
+	if [[ "$HAD_PREVIOUS" == true ]]; then
+		cp -a -- "$BACKUP_FILE" "$CONNECTION_FILE"
+	else
+		rm -f -- "$CONNECTION_FILE"
+	fi
+	# Restore the previously generated network state on a best-effort basis.
+	netplan generate >/dev/null 2>&1 && netplan apply --timeout 0 >/dev/null 2>&1 || true
+}
+
+if ! iw dev "$INTERFACE" info >/dev/null 2>&1; then
+	echo "Wireless interface $INTERFACE is not ready." >&2
+	exit 1
+fi
+
+if command -v rfkill >/dev/null 2>&1; then
+	rfkill unblock wifi >/dev/null 2>&1 || rfkill unblock all >/dev/null 2>&1 || true
+fi
+ip link set dev "$INTERFACE" up
+
+mkdir -p -- "$NETPLAN_DIR"
+TEMP_FILE="$(mktemp "${NETPLAN_DIR}/.armbian-firstlogin-wifi.XXXXXX")"
+if [[ -e "$CONNECTION_FILE" ]]; then
+	HAD_PREVIOUS=true
+	BACKUP_FILE="$(mktemp "${NETPLAN_DIR}/.armbian-firstlogin-wifi-backup.XXXXXX")"
+	cp -a -- "$CONNECTION_FILE" "$BACKUP_FILE"
+fi
+
+# JSON is valid YAML. Generating it with json.dump avoids corrupting Netplan
+# when an SSID or passphrase contains quotes, backslashes, colons, or '#'.
+printf '%s' "$PASSWORD" | python3 -c '
+import json
+import pathlib
+import sys
+
+destination, interface, ssid = sys.argv[1:]
+password = sys.stdin.read()
+access_point = {} if not password else {"password": password}
+document = {
+    "network": {
+        "version": 2,
+        "wifis": {
+            interface: {
+                "dhcp4": True,
+                "dhcp6": True,
+                "access-points": {ssid: access_point},
+            }
+        },
+    }
+}
+pathlib.Path(destination).write_text(
+    json.dumps(document, ensure_ascii=False, indent=2) + "\n",
+    encoding="utf-8",
+)
+' "$TEMP_FILE" "$INTERFACE" "$SSID"
+chmod 0600 "$TEMP_FILE"
+mv -f -- "$TEMP_FILE" "$CONNECTION_FILE"
+TEMP_FILE=""
+
+if ! netplan generate; then
+	echo "Netplan rejected the wireless configuration." >&2
+	rollback
+	exit 1
+fi
+if ! netplan apply --timeout 0; then
+	echo "Netplan could not apply the wireless configuration." >&2
+	rollback
+	exit 1
+fi
+
+for ((attempt = 1; attempt <= WAIT_ATTEMPTS; attempt++)); do
+	if iw dev "$INTERFACE" link 2>/dev/null | grep -q '^Connected to '; then
+		echo "Wireless link connected to ${SSID}."
+		exit 0
+	fi
+	printf '\rWaiting for wireless link (%d/%d)' "$attempt" "$WAIT_ATTEMPTS"
+	sleep "$WAIT_DELAY"
+done
+echo "" >&2
+echo "Wireless association failed. Check the passphrase or signal strength." >&2
+rollback
+exit 1

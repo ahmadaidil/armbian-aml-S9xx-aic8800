@@ -1,12 +1,31 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-SCRIPT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/overlay/usr/local/sbin/aic8800-pandora-switch"
+SCRIPT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/overlay/common/usr/local/sbin/aic8800-pandora-switch"
 TEST_ROOT="$(mktemp -d)"
 trap 'rm -rf "$TEST_ROOT"' EXIT
 
 mkdir -p "$TEST_ROOT/sys/bus/usb/devices" "$TEST_ROOT/bin"
 printf 'test\n' > "$TEST_ROOT/config"
+
+# macOS does not ship the util-linux flock command. Build the tiny subset used
+# by the target script so the locking and concurrency test still runs locally.
+if ! command -v flock >/dev/null 2>&1; then
+    cat > "$TEST_ROOT/flock.c" <<'EOF'
+#include <stdio.h>
+#include <stdlib.h>
+#include <sys/file.h>
+
+int main(int argc, char **argv) {
+    if (argc != 4 || argv[1][0] != '-' || argv[1][1] != 'w') {
+        return 2;
+    }
+    return flock(atoi(argv[3]), LOCK_EX) == 0 ? 0 : 1;
+}
+EOF
+    cc "$TEST_ROOT/flock.c" -o "$TEST_ROOT/bin/flock"
+    export PATH="$TEST_ROOT/bin:$PATH"
+fi
 
 run_switch() {
     AIC_SYSFS_ROOT="$TEST_ROOT/sys" \

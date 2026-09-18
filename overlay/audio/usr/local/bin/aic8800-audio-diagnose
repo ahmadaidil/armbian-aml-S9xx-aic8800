@@ -5,8 +5,8 @@ usage() {
     cat <<'EOF'
 Usage: aic8800-audio-diagnose [--record [SECONDS] [OUTPUT.wav]]
 
-Run as the logged-in desktop user, not with sudo. Without --record the command
-is read-only. Recording uses the first Bluetooth source, or the default source.
+Run as the logged-in user, not with sudo. Without --record the command is
+read-only. Recording uses the first Bluetooth source, or the default source.
 EOF
 }
 
@@ -28,35 +28,14 @@ fi
 
 section() { printf '\n== %s ==\n' "$1"; }
 
-section "USB AIC/Pandora devices"
-lsusb 2>/dev/null | grep -Ei '1111:1111|a69c:|368b:' || echo "No matching USB device found"
+if command -v aic8800-bluetooth-diagnose >/dev/null 2>&1; then
+    aic8800-bluetooth-diagnose
+fi
 
-section "Kernel modules"
-lsmod 2>/dev/null | grep -E '^(aic|btusb)' || echo "No AIC/btusb modules currently loaded"
-
-section "USB controller driver bindings"
-binding_found=false
-for device_path in /sys/bus/usb/devices/*; do
-    [[ -r "$device_path/idVendor" && -r "$device_path/idProduct" ]] || continue
-    vendor="$(<"$device_path/idVendor")"
-    product="$(<"$device_path/idProduct")"
-    case "${vendor}:${product}" in
-        1111:1111|a69c:*|368b:*) ;;
-        *) continue ;;
-    esac
-    binding_found=true
-    driver="unbound"
-    [[ -L "$device_path/driver" ]] && driver="$(basename "$(readlink "$device_path/driver")")"
-    printf '%s  sysfs=%s  driver=%s\n' "${vendor}:${product}" "$(basename "$device_path")" "$driver"
-done
-[[ "$binding_found" == true ]] || echo "No matching USB controller binding found"
-
-section "Bluetooth service and controllers"
-systemctl is-active bluetooth.service 2>/dev/null || true
-bluetoothctl list 2>/dev/null || true
-bluetoothctl show 2>/dev/null || true
-
-section "PipeWire / WirePlumber"
+section "PipeWire / WirePlumber user session"
+systemctl --user is-active pipewire.socket 2>/dev/null || true
+systemctl --user is-active pipewire-pulse.socket 2>/dev/null || true
+systemctl --user is-active wireplumber.service 2>/dev/null || true
 wpctl status -n 2>/dev/null || echo "PipeWire user session is unavailable"
 
 section "Bluetooth cards and input sources"
@@ -68,7 +47,7 @@ default_source="$(pactl get-default-source 2>/dev/null || true)"
 printf 'Default source: %s\n' "${default_source:-unavailable}"
 while read -r source_name; do
     [[ -n "$source_name" ]] || continue
-    printf '%s\n' "Source: $source_name"
+    printf 'Source: %s\n' "$source_name"
     pactl get-source-mute "$source_name" 2>/dev/null || true
     pactl get-source-volume "$source_name" 2>/dev/null || true
 done < <(pactl list sources short 2>/dev/null | awk '$2 ~ /^bluez_input/ {print $2}')

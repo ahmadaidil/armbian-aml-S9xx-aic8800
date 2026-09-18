@@ -1,8 +1,6 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-readonly ARMBIAN_IMAGE_ALIAS="https://dl.armbian.com/aml-s9xx-box/Resolute_current_xfce"
-readonly ARMBIAN_SHA_ALIAS="${ARMBIAN_IMAGE_ALIAS}.sha"
 readonly AIC_REPOSITORY="https://github.com/shenmintao/aic8800d80.git"
 readonly AIC_BRANCH="main"
 readonly BUILDER_IMAGE="armbian-aic8800-image-customizer:local"
@@ -11,18 +9,32 @@ readonly REQUIRED_FREE_GIB=11
 PROJECT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 OUTPUT_DIR="${PROJECT_DIR}/dist"
 CHECK_ONLY=false
+VARIANT="xfce"
+BLUETOOTH_AUDIO_REQUESTED=false
 
 usage() {
     cat <<'EOF'
-Usage: ./build.sh [--check] [--output-dir DIR]
+Usage: ./build.sh [--variant xfce|minimal] [--bluetooth-audio] [--check] [--output-dir DIR]
 
-  --check           Validate local prerequisites and available disk space only.
-  --output-dir DIR  Write the compressed image and metadata to DIR (default: dist).
+  --variant VARIANT   Build xfce (default) or minimal.
+  --bluetooth-audio   Add PipeWire/WirePlumber Bluetooth audio to minimal.
+                      XFCE already includes Bluetooth audio.
+  --check             Validate the selected profile, prerequisites, and disk space.
+  --output-dir DIR    Write the compressed image and metadata to DIR (default: dist).
 EOF
 }
 
 while (($#)); do
     case "$1" in
+        --variant)
+            [[ $# -ge 2 ]] || { echo "--variant requires xfce or minimal" >&2; exit 2; }
+            VARIANT="$2"
+            shift 2
+            ;;
+        --bluetooth-audio)
+            BLUETOOTH_AUDIO_REQUESTED=true
+            shift
+            ;;
         --check)
             CHECK_ONLY=true
             shift
@@ -43,6 +55,30 @@ while (($#)); do
             ;;
     esac
 done
+
+case "$VARIANT" in
+    xfce)
+        ARMBIAN_IMAGE_ALIAS="https://dl.armbian.com/aml-s9xx-box/Resolute_current_xfce"
+        EXPECTED_DISTRO_ID="ubuntu"
+        EXPECTED_DISTRO_VERSION="26.04"
+        BLUETOOTH_AUDIO=true
+        if [[ "$BLUETOOTH_AUDIO_REQUESTED" == true ]]; then
+            echo "Notice: --bluetooth-audio is already enabled by the XFCE profile."
+        fi
+        ;;
+    minimal)
+        ARMBIAN_IMAGE_ALIAS="https://dl.armbian.com/aml-s9xx-box/Trixie_current_minimal"
+        EXPECTED_DISTRO_ID="debian"
+        EXPECTED_DISTRO_VERSION="13"
+        BLUETOOTH_AUDIO="$BLUETOOTH_AUDIO_REQUESTED"
+        ;;
+    *)
+        echo "Invalid variant: $VARIANT (expected xfce or minimal)" >&2
+        usage >&2
+        exit 2
+        ;;
+esac
+ARMBIAN_SHA_ALIAS="${ARMBIAN_IMAGE_ALIAS}.sha"
 
 for command_name in curl docker git shasum tar xz; do
     command -v "$command_name" >/dev/null 2>&1 || {
@@ -67,6 +103,9 @@ fi
 if [[ "$CHECK_ONLY" == true ]]; then
     printf 'Prerequisites OK; %.1f GiB is available.\n' \
         "$(awk -v kib="$available_kib" 'BEGIN {print kib / 1024 / 1024}')"
+    printf 'Variant: %s\nBluetooth audio: %s\nImage alias: %s\nExpected distribution: %s %s\n' \
+        "$VARIANT" "$BLUETOOTH_AUDIO" "$ARMBIAN_IMAGE_ALIAS" \
+        "$EXPECTED_DISTRO_ID" "$EXPECTED_DISTRO_VERSION"
     exit 0
 fi
 
@@ -97,6 +136,20 @@ download_image() {
             echo "Unsafe or unexpected image filename in SHA sidecar: $expected_name" >&2
             return 1
         }
+        case "$VARIANT" in
+            xfce)
+                [[ "$expected_name" == *_resolute_current_*_xfce_desktop.img.xz ]] || {
+                    echo "SHA sidecar does not describe a Resolute current XFCE image: $expected_name" >&2
+                    return 1
+                }
+                ;;
+            minimal)
+                [[ "$expected_name" == *_trixie_current_*_minimal.img.xz ]] || {
+                    echo "SHA sidecar does not describe a Trixie current minimal image: $expected_name" >&2
+                    return 1
+                }
+                ;;
+        esac
         candidate="${PROJECT_DIR}/.cache/${expected_name}"
         if [[ ! -f "$candidate" ]]; then
             curl --fail --location --show-error --progress-bar "$ARMBIAN_IMAGE_ALIAS" -o "${candidate}.partial"
@@ -141,12 +194,17 @@ docker run --rm --privileged --platform linux/arm64 \
     "$CONTAINER_RAW_IMAGE" \
     "$CONTAINER_DRIVER_DIR" \
     /workspace/overlay \
-    "$CONTAINER_RESULT_ENV"
+    "$CONTAINER_RESULT_ENV" \
+    "$VARIANT" \
+    "$BLUETOOTH_AUDIO"
 
 # shellcheck disable=SC1090
 source "${WORK_DIR}/customization.env"
 
 output_stem="${INPUT_NAME%.img.xz}-aic8800"
+if [[ "$VARIANT" == minimal && "$BLUETOOTH_AUDIO" == true ]]; then
+    output_stem+="-btaudio"
+fi
 OUTPUT_IMAGE="${OUTPUT_DIR}/${output_stem}.img.xz"
 OUTPUT_SHA_FILE="${OUTPUT_IMAGE}.sha256"
 OUTPUT_MANIFEST="${OUTPUT_DIR}/${output_stem}.manifest.json"
@@ -157,8 +215,43 @@ mv "${OUTPUT_IMAGE}.partial" "$OUTPUT_IMAGE"
 OUTPUT_SHA="$(shasum -a 256 "$OUTPUT_IMAGE" | awk '{print $1}')"
 printf '%s  %s\n' "$OUTPUT_SHA" "$(basename "$OUTPUT_IMAGE")" > "$OUTPUT_SHA_FILE"
 
+json_nullable_string() {
+    if [[ -n "$1" ]]; then
+        printf '"%s"' "$1"
+    else
+        printf 'null'
+    fi
+}
+
+XFCE_SESSION_JSON="$(json_nullable_string "$XFCE_SESSION_VERSION")"
+PIPEWIRE_AUDIO_JSON="$(json_nullable_string "$PIPEWIRE_AUDIO_VERSION")"
+LIBSPA_BLUETOOTH_JSON="$(json_nullable_string "$LIBSPA_BLUETOOTH_VERSION")"
+WIREPLUMBER_JSON="$(json_nullable_string "$WIREPLUMBER_VERSION")"
+PULSEAUDIO_UTILS_JSON="$(json_nullable_string "$PULSEAUDIO_UTILS_VERSION")"
+PYTHON3_JSON="$(json_nullable_string "$PYTHON3_VERSION")"
+PAVUCONTROL_JSON="$(json_nullable_string "$PAVUCONTROL_VERSION")"
+XFCE_PULSEAUDIO_PLUGIN_JSON="$(json_nullable_string "$XFCE_PULSEAUDIO_PLUGIN_VERSION")"
+if [[ "$BLUETOOTH_AUDIO" == true ]]; then
+    AUDIO_SESSION_MANAGER_JSON='"wireplumber"'
+    HFP_BACKEND_JSON='"native"'
+else
+    AUDIO_SESSION_MANAGER_JSON='null'
+    HFP_BACKEND_JSON='null'
+fi
+if [[ "$VARIANT" == xfce ]]; then
+    DESKTOP_ENABLED=true
+    PANEL_ORDER_JSON='["clock", "separator", "actions-full-name", "separator", "pulseaudio", "network", "bluetooth", "separator", "workspace-switcher"]'
+else
+    DESKTOP_ENABLED=false
+    PANEL_ORDER_JSON='null'
+fi
+
 cat > "$OUTPUT_MANIFEST" <<EOF
 {
+  "profile": {
+    "variant": "${VARIANT}",
+    "bluetooth_audio": ${BLUETOOTH_AUDIO}
+  },
   "source": {
     "alias": "${ARMBIAN_IMAGE_ALIAS}",
     "filename": "${INPUT_NAME}",
@@ -168,7 +261,7 @@ cat > "$OUTPUT_MANIFEST" <<EOF
     "kernel": "${KERNEL_RELEASE}",
     "kernel_package": "${KERNEL_PACKAGE}",
     "kernel_package_version": "${KERNEL_PACKAGE_VERSION}",
-    "xfce_session_version": "${XFCE_SESSION_VERSION}",
+    "xfce_session_version": ${XFCE_SESSION_JSON},
     "headers_source": "${HEADER_SOURCE}"
   },
   "packages": {
@@ -176,10 +269,15 @@ cat > "$OUTPUT_MANIFEST" <<EOF
     "dkms": "${DKMS_PACKAGE_VERSION}",
     "build-essential": "${BUILD_ESSENTIAL_VERSION}",
     "usb-modeswitch": "${USB_MODESWITCH_VERSION}",
+    "usbutils": "${USBUTILS_VERSION}",
     "bluez": "${BLUEZ_VERSION}",
-    "pipewire-audio": "${PIPEWIRE_AUDIO_VERSION}",
-    "wireplumber": "${WIREPLUMBER_VERSION}",
-    "xfce4-pulseaudio-plugin": "${XFCE_PULSEAUDIO_PLUGIN_VERSION}"
+    "pipewire-audio": ${PIPEWIRE_AUDIO_JSON},
+    "libspa-0.2-bluetooth": ${LIBSPA_BLUETOOTH_JSON},
+    "wireplumber": ${WIREPLUMBER_JSON},
+    "pulseaudio-utils": ${PULSEAUDIO_UTILS_JSON},
+    "python3": ${PYTHON3_JSON},
+    "pavucontrol": ${PAVUCONTROL_JSON},
+    "xfce4-pulseaudio-plugin": ${XFCE_PULSEAUDIO_PLUGIN_JSON}
   },
   "driver": {
     "repository": "${AIC_REPOSITORY}",
@@ -188,20 +286,25 @@ cat > "$OUTPUT_MANIFEST" <<EOF
     "dkms": "aic8800/1.0.0",
     "modules": ["aic8800_fdrv", "aic_load_fw", "aic_zlp_quirk"]
   },
+  "first_login_wifi": {
+    "netplan_configuration": "json-yaml",
+    "association_check": "local-iw-link",
+    "external_connectivity_required": false,
+    "rfkill_unblock": true
+  },
   "bluetooth_audio": {
+    "enabled": ${BLUETOOTH_AUDIO},
     "transport": "btusb",
     "legacy_aic8800_btusb_blocked": true,
-    "session_manager": "wireplumber",
-    "hfp_backend": "native",
-    "automatic_headset_profile": true
+    "session_manager": ${AUDIO_SESSION_MANAGER_JSON},
+    "hfp_backend": ${HFP_BACKEND_JSON},
+    "automatic_headset_profile": ${BLUETOOTH_AUDIO}
   },
   "desktop": {
-    "xfce_panel_plugin": true,
-    "xfce_multimedia_keys": true,
-    "xfce_panel_order_right_to_left": [
-      "clock", "separator", "actions-full-name", "separator",
-      "pulseaudio", "network", "bluetooth", "separator", "workspace-switcher"
-    ],
+    "xfce": ${DESKTOP_ENABLED},
+    "xfce_panel_plugin": ${DESKTOP_ENABLED},
+    "xfce_multimedia_keys": ${DESKTOP_ENABLED},
+    "xfce_panel_order_right_to_left": ${PANEL_ORDER_JSON},
     "hidden_volume_labels": ["BOOT_EMMC", "ROOTFS_EMMC"]
   },
   "boot": {
